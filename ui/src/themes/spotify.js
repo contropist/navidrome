@@ -10,7 +10,6 @@ const musicListActions = {
   alignItems: 'center',
   '@global': {
     button: {
-      margin: 5,
       border: '1px solid transparent',
       backgroundColor: 'inherit',
       color: '#b3b3b3',
@@ -231,6 +230,8 @@ export default {
         fontSize: '.875rem',
         color: 'rgba(255,255,255, 0.8)',
       },
+    },
+    NDCollapsibleComment: {
       commentBlock: {
         fontSize: '.875rem',
         color: 'rgba(255,255,255, 0.8)',

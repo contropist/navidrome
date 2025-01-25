@@ -19,8 +19,8 @@ import (
 )
 
 type MediaStreamer interface {
-	NewStream(ctx context.Context, id string, reqFormat string, reqBitRate int) (*Stream, error)
-	DoStream(ctx context.Context, mf *model.MediaFile, reqFormat string, reqBitRate int) (*Stream, error)
+	NewStream(ctx context.Context, id string, reqFormat string, reqBitRate int, offset int) (*Stream, error)
+	DoStream(ctx context.Context, mf *model.MediaFile, reqFormat string, reqBitRate int, reqOffset int) (*Stream, error)
 }
 
 type TranscodingCache cache.FileCache
@@ -40,22 +40,23 @@ type streamJob struct {
 	mf      *model.MediaFile
 	format  string
 	bitRate int
+	offset  int
 }
 
 func (j *streamJob) Key() string {
-	return fmt.Sprintf("%s.%s.%d.%s", j.mf.ID, j.mf.UpdatedAt.Format(time.RFC3339Nano), j.bitRate, j.format)
+	return fmt.Sprintf("%s.%s.%d.%s.%d", j.mf.ID, j.mf.UpdatedAt.Format(time.RFC3339Nano), j.bitRate, j.format, j.offset)
 }
 
-func (ms *mediaStreamer) NewStream(ctx context.Context, id string, reqFormat string, reqBitRate int) (*Stream, error) {
+func (ms *mediaStreamer) NewStream(ctx context.Context, id string, reqFormat string, reqBitRate int, reqOffset int) (*Stream, error) {
 	mf, err := ms.ds.MediaFile(ctx).Get(id)
 	if err != nil {
 		return nil, err
 	}
 
-	return ms.DoStream(ctx, mf, reqFormat, reqBitRate)
+	return ms.DoStream(ctx, mf, reqFormat, reqBitRate, reqOffset)
 }
 
-func (ms *mediaStreamer) DoStream(ctx context.Context, mf *model.MediaFile, reqFormat string, reqBitRate int) (*Stream, error) {
+func (ms *mediaStreamer) DoStream(ctx context.Context, mf *model.MediaFile, reqFormat string, reqBitRate int, reqOffset int) (*Stream, error) {
 	var format string
 	var bitRate int
 	var cached bool
@@ -70,7 +71,7 @@ func (ms *mediaStreamer) DoStream(ctx context.Context, mf *model.MediaFile, reqF
 
 	if format == "raw" {
 		log.Debug(ctx, "Streaming RAW file", "id", mf.ID, "path", mf.Path,
-			"requestBitrate", reqBitRate, "requestFormat", reqFormat,
+			"requestBitrate", reqBitRate, "requestFormat", reqFormat, "requestOffset", reqOffset,
 			"originalBitrate", mf.BitRate, "originalFormat", mf.Suffix,
 			"selectedBitrate", bitRate, "selectedFormat", format)
 		f, err := os.Open(mf.Path)
@@ -88,6 +89,7 @@ func (ms *mediaStreamer) DoStream(ctx context.Context, mf *model.MediaFile, reqF
 		mf:      mf,
 		format:  format,
 		bitRate: bitRate,
+		offset:  reqOffset,
 	}
 	r, err := ms.cache.Get(ctx, job)
 	if err != nil {
@@ -100,7 +102,7 @@ func (ms *mediaStreamer) DoStream(ctx context.Context, mf *model.MediaFile, reqF
 	s.Seeker = r.Seeker
 
 	log.Debug(ctx, "Streaming TRANSCODED file", "id", mf.ID, "path", mf.Path,
-		"requestBitrate", reqBitRate, "requestFormat", reqFormat,
+		"requestBitrate", reqBitRate, "requestFormat", reqFormat, "requestOffset", reqOffset,
 		"originalBitrate", mf.BitRate, "originalFormat", mf.Suffix,
 		"selectedBitrate", bitRate, "selectedFormat", format, "cached", cached, "seekable", s.Seekable())
 
@@ -129,11 +131,11 @@ func (s *Stream) EstimatedContentLength() int {
 func selectTranscodingOptions(ctx context.Context, ds model.DataStore, mf *model.MediaFile, reqFormat string, reqBitRate int) (format string, bitRate int) {
 	format = "raw"
 	if reqFormat == "raw" {
-		return
+		return format, 0
 	}
 	if reqFormat == mf.Suffix && reqBitRate == 0 {
 		bitRate = mf.BitRate
-		return
+		return format, bitRate
 	}
 	trc, hasDefault := request.TranscodingFrom(ctx)
 	var cFormat string
@@ -147,8 +149,10 @@ func selectTranscodingOptions(ctx context.Context, ds model.DataStore, mf *model
 			if p, ok := request.PlayerFrom(ctx); ok {
 				cBitRate = p.MaxBitRate
 			}
-		} else if reqBitRate > 0 && conf.Server.DefaultDownsamplingFormat != "" {
-			// If no format is specified and no transcoding associated to the player, but a bitrate is specfied, and there is no transcoding set for the player, we use the default downsampling format
+		} else if reqBitRate > 0 && reqBitRate < mf.BitRate && conf.Server.DefaultDownsamplingFormat != "" {
+			// If no format is specified and no transcoding associated to the player, but a bitrate is specified,
+			// and there is no transcoding set for the player, we use the default downsampling format.
+			// But only if the requested bitRate is lower than the original bitRate.
 			log.Debug("Default Downsampling", "Using default downsampling format", conf.Server.DefaultDownsamplingFormat)
 			cFormat = conf.Server.DefaultDownsamplingFormat
 		}
@@ -157,7 +161,7 @@ func selectTranscodingOptions(ctx context.Context, ds model.DataStore, mf *model
 		cBitRate = reqBitRate
 	}
 	if cBitRate == 0 && cFormat == "" {
-		return
+		return format, bitRate
 	}
 	t, err := ds.Transcoding(ctx).FindByFormat(cFormat)
 	if err == nil {
@@ -182,22 +186,26 @@ var (
 
 func GetTranscodingCache() TranscodingCache {
 	onceTranscodingCache.Do(func() {
-		instanceTranscodingCache = cache.NewFileCache("Transcoding", conf.Server.TranscodingCacheSize,
-			consts.TranscodingCacheDir, consts.DefaultTranscodingCacheMaxItems,
-			func(ctx context.Context, arg cache.Item) (io.Reader, error) {
-				job := arg.(*streamJob)
-				t, err := job.ms.ds.Transcoding(ctx).FindByFormat(job.format)
-				if err != nil {
-					log.Error(ctx, "Error loading transcoding command", "format", job.format, err)
-					return nil, os.ErrInvalid
-				}
-				out, err := job.ms.transcoder.Transcode(ctx, t.Command, job.mf.Path, job.bitRate)
-				if err != nil {
-					log.Error(ctx, "Error starting transcoder", "id", job.mf.ID, err)
-					return nil, os.ErrInvalid
-				}
-				return out, nil
-			})
+		instanceTranscodingCache = NewTranscodingCache()
 	})
 	return instanceTranscodingCache
+}
+
+func NewTranscodingCache() TranscodingCache {
+	return cache.NewFileCache("Transcoding", conf.Server.TranscodingCacheSize,
+		consts.TranscodingCacheDir, consts.DefaultTranscodingCacheMaxItems,
+		func(ctx context.Context, arg cache.Item) (io.Reader, error) {
+			job := arg.(*streamJob)
+			t, err := job.ms.ds.Transcoding(ctx).FindByFormat(job.format)
+			if err != nil {
+				log.Error(ctx, "Error loading transcoding command", "format", job.format, err)
+				return nil, os.ErrInvalid
+			}
+			out, err := job.ms.transcoder.Transcode(ctx, t.Command, job.mf.Path, job.bitRate, job.offset)
+			if err != nil {
+				log.Error(ctx, "Error starting transcoder", "id", job.mf.ID, err)
+				return nil, os.ErrInvalid
+			}
+			return out, nil
+		})
 }

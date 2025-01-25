@@ -1,7 +1,7 @@
-import jwtDecode from 'jwt-decode'
+import { jwtDecode } from 'jwt-decode'
 import { baseUrl } from './utils'
 import config from './config'
-import { startEventStream, stopEventStream } from './eventStream'
+import { removeHomeCache } from './utils/removeHomeCache'
 
 // config sent from server may contain authentication info, for example when the user is authenticated
 // by a reverse proxy request header
@@ -9,6 +9,7 @@ if (config.auth) {
   try {
     storeAuthenticationInfo(config.auth)
   } catch (e) {
+    // eslint-disable-next-line no-console
     console.log(e)
   }
 }
@@ -48,9 +49,7 @@ const authProvider = {
         storeAuthenticationInfo(response)
         // Avoid "going to create admin" dialog after logout/login without a refresh
         config.firstTime = false
-        if (config.devActivityPanel) {
-          startEventStream()
-        }
+        removeHomeCache()
         return response
       })
       .catch((error) => {
@@ -66,7 +65,6 @@ const authProvider = {
   },
 
   logout: () => {
-    stopEventStream()
     removeItems()
     return Promise.resolve()
   },
@@ -90,11 +88,11 @@ const authProvider = {
   },
 
   getIdentity: () => {
-    return {
+    return Promise.resolve({
       id: localStorage.getItem('username'),
       fullName: localStorage.getItem('name'),
       avatar: localStorage.getItem('avatar'),
-    }
+    })
   },
 }
 

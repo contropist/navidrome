@@ -1,31 +1,12 @@
 package number
 
-import "golang.org/x/exp/constraints"
+import (
+	"strconv"
 
-func Min[T constraints.Ordered](vs ...T) T {
-	if len(vs) == 0 {
-		var zero T
-		return zero
-	}
-	min := vs[0]
-	for _, v := range vs[1:] {
-		if v < min {
-			min = v
-		}
-	}
-	return min
-}
+	"golang.org/x/exp/constraints"
+)
 
-func Max[T constraints.Ordered](vs ...T) T {
-	if len(vs) == 0 {
-		var zero T
-		return zero
-	}
-	max := vs[0]
-	for _, v := range vs[1:] {
-		if v > max {
-			max = v
-		}
-	}
-	return max
+func ParseInt[T constraints.Integer](s string) T {
+	r, _ := strconv.ParseInt(s, 10, 64)
+	return T(r)
 }

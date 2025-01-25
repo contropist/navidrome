@@ -1,3 +1,5 @@
+import stylesheet from './monokai.css.js'
+
 export default {
   themeName: 'Monokai',
   palette: {
@@ -98,7 +100,7 @@ export default {
     },
   },
   player: {
-    theme: 'monokai',
-    stylesheet: require('./monokai.css.js'),
+    theme: 'dark',
+    stylesheet,
   },
 }

@@ -2,33 +2,35 @@ package ffmpeg
 
 import (
 	"bufio"
+	"context"
 	"errors"
-	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/navidrome/navidrome/conf"
+	"github.com/navidrome/navidrome/core/ffmpeg"
 	"github.com/navidrome/navidrome/log"
 	"github.com/navidrome/navidrome/scanner/metadata"
 )
 
 const ExtractorID = "ffmpeg"
 
-type Extractor struct{}
+type Extractor struct {
+	ffmpeg ffmpeg.FFmpeg
+}
 
 func (e *Extractor) Parse(files ...string) (map[string]metadata.ParsedTags, error) {
-	args := e.createProbeCommand(files)
-
-	log.Trace("Executing command", "args", args)
-	cmd := exec.Command(args[0], args[1:]...) // #nosec
-	output, _ := cmd.CombinedOutput()
+	output, err := e.ffmpeg.Probe(context.TODO(), files)
+	if err != nil {
+		log.Error("Cannot use ffmpeg to extract tags. Aborting", err)
+		return nil, err
+	}
 	fileTags := map[string]metadata.ParsedTags{}
 	if len(output) == 0 {
 		return fileTags, errors.New("error extracting metadata files")
 	}
-	infos := e.parseOutput(string(output))
+	infos := e.parseOutput(output)
 	for file, info := range infos {
 		tags, err := e.extractMetadata(file, info)
 		// Skip files with errors
@@ -41,9 +43,14 @@ func (e *Extractor) Parse(files ...string) (map[string]metadata.ParsedTags, erro
 
 func (e *Extractor) CustomMappings() metadata.ParsedTags {
 	return metadata.ParsedTags{
-		"disc":        {"tpa"},
-		"has_picture": {"metadata_block_picture"},
+		"disc":         {"tpa"},
+		"has_picture":  {"metadata_block_picture"},
+		"originaldate": {"tdor"},
 	}
+}
+
+func (e *Extractor) Version() string {
+	return e.ffmpeg.Version()
 }
 
 func (e *Extractor) extractMetadata(filePath, info string) (metadata.ParsedTags, error) {
@@ -74,7 +81,8 @@ var (
 
 	//    Stream #0:0: Audio: mp3, 44100 Hz, stereo, fltp, 192 kb/s
 	//    Stream #0:0: Audio: flac, 44100 Hz, stereo, s16
-	audioStreamRx = regexp.MustCompile(`^\s{2,4}Stream #\d+:\d+.*: Audio: (.*), (.* Hz), ([\w.]+),*(.*.,)*`)
+	//    Stream #0:0: Audio: dsd_lsbf_planar, 352800 Hz, stereo, fltp, 5644 kb/s
+	audioStreamRx = regexp.MustCompile(`^\s{2,4}Stream #\d+:\d+.*: Audio: (.*), (.*) Hz, ([\w.]+),*(.*.,)*`)
 
 	//    Stream #0:1: Video: mjpeg, yuvj444p(pc, bt470bg/unknown/unknown), 600x600 [SAR 1:1 DAR 1:1], 90k tbr, 90k tbn, 90k tbc`
 	coverRx = regexp.MustCompile(`^\s{2,4}Stream #\d+:.+: (Video):.*`)
@@ -159,6 +167,7 @@ func (e *Extractor) parseInfo(info string) map[string][]string {
 
 		match = audioStreamRx.FindStringSubmatch(line)
 		if len(match) > 0 {
+			tags["samplerate"] = []string{match[2]}
 			tags["channels"] = []string{e.parseChannels(match[3])}
 		}
 	}
@@ -197,22 +206,6 @@ func (e *Extractor) parseChannels(tag string) string {
 }
 
 // Inputs will always be absolute paths
-func (e *Extractor) createProbeCommand(inputs []string) []string {
-	split := strings.Split(conf.Server.ProbeCommand, " ")
-	args := make([]string, 0)
-
-	for _, s := range split {
-		if s == "%s" {
-			for _, inp := range inputs {
-				args = append(args, "-i", inp)
-			}
-		} else {
-			args = append(args, s)
-		}
-	}
-	return args
-}
-
 func init() {
-	metadata.RegisterExtractor(ExtractorID, &Extractor{})
+	metadata.RegisterExtractor(ExtractorID, &Extractor{ffmpeg: ffmpeg.New()})
 }
