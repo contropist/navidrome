@@ -5,7 +5,6 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"regexp"
 	"time"
 
 	"github.com/navidrome/navidrome/conf"
@@ -15,15 +14,16 @@ import (
 	"github.com/navidrome/navidrome/resources"
 	"github.com/navidrome/navidrome/server/subsonic/filter"
 	"github.com/navidrome/navidrome/server/subsonic/responses"
-	"github.com/navidrome/navidrome/utils"
 	"github.com/navidrome/navidrome/utils/gravatar"
+	"github.com/navidrome/navidrome/utils/req"
 )
 
 func (api *Router) GetAvatar(w http.ResponseWriter, r *http.Request) (*responses.Subsonic, error) {
 	if !conf.Server.EnableGravatar {
 		return api.getPlaceHolderAvatar(w, r)
 	}
-	username, err := requiredParamString(r, "username")
+	p := req.Params(r)
+	username, err := p.String("username")
 	if err != nil {
 		return nil, err
 	}
@@ -53,10 +53,20 @@ func (api *Router) getPlaceHolderAvatar(w http.ResponseWriter, r *http.Request) 
 }
 
 func (api *Router) GetCoverArt(w http.ResponseWriter, r *http.Request) (*responses.Subsonic, error) {
-	id := utils.ParamString(r, "id")
-	size := utils.ParamInt(r, "size", 0)
+	// If context is already canceled, discard request without further processing
+	if r.Context().Err() != nil {
+		return nil, nil //nolint:nilerr
+	}
 
-	imgReader, lastUpdate, err := api.artwork.Get(r.Context(), id, size)
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	p := req.Params(r)
+	id, _ := p.String("id")
+	size := p.IntOr("size", 0)
+	square := p.BoolOr("square", false)
+
+	imgReader, lastUpdate, err := api.artwork.GetOrPlaceholder(ctx, id, size, square)
 	w.Header().Set("cache-control", "public, max-age=315360000")
 	w.Header().Set("last-modified", lastUpdate.Format(time.RFC1123))
 
@@ -64,7 +74,7 @@ func (api *Router) GetCoverArt(w http.ResponseWriter, r *http.Request) (*respons
 	case errors.Is(err, context.Canceled):
 		return nil, nil
 	case errors.Is(err, model.ErrNotFound):
-		log.Error(r, "Couldn't find coverArt", "id", id, err)
+		log.Warn(r, "Couldn't find coverArt", "id", id, err)
 		return nil, newError(responses.ErrorDataNotFound, "Artwork not found")
 	case err != nil:
 		log.Error(r, "Error retrieving coverArt", "id", id, err)
@@ -72,24 +82,18 @@ func (api *Router) GetCoverArt(w http.ResponseWriter, r *http.Request) (*respons
 	}
 
 	defer imgReader.Close()
-	_, err = io.Copy(w, imgReader)
+	cnt, err := io.Copy(w, imgReader)
+	if err != nil {
+		log.Warn(ctx, "Error sending image", "count", cnt, err)
+	}
 
 	return nil, err
 }
 
-const timeStampRegex string = `(\[([0-9]{1,2}:)?([0-9]{1,2}:)([0-9]{1,2})(\.[0-9]{1,2})?\])`
-
-func isSynced(rawLyrics string) bool {
-	r := regexp.MustCompile(timeStampRegex)
-	// Eg: [04:02:50.85]
-	// [02:50.85]
-	// [02:50]
-	return r.MatchString(rawLyrics)
-}
-
 func (api *Router) GetLyrics(r *http.Request) (*responses.Subsonic, error) {
-	artist := utils.ParamString(r, "artist")
-	title := utils.ParamString(r, "title")
+	p := req.Params(r)
+	artist, _ := p.String("artist")
+	title, _ := p.String("title")
 	response := newResponse()
 	lyrics := responses.Lyrics{}
 	response.Lyrics = &lyrics
@@ -103,15 +107,46 @@ func (api *Router) GetLyrics(r *http.Request) (*responses.Subsonic, error) {
 		return response, nil
 	}
 
+	structuredLyrics, err := mediaFiles[0].StructuredLyrics()
+	if err != nil {
+		return nil, err
+	}
+
+	if len(structuredLyrics) == 0 {
+		return response, nil
+	}
+
 	lyrics.Artist = artist
 	lyrics.Title = title
 
-	if isSynced(mediaFiles[0].Lyrics) {
-		r := regexp.MustCompile(timeStampRegex)
-		lyrics.Value = r.ReplaceAllString(mediaFiles[0].Lyrics, "")
-	} else {
-		lyrics.Value = mediaFiles[0].Lyrics
+	lyricsText := ""
+	for _, line := range structuredLyrics[0].Line {
+		lyricsText += line.Value + "\n"
 	}
+
+	lyrics.Value = lyricsText
+
+	return response, nil
+}
+
+func (api *Router) GetLyricsBySongId(r *http.Request) (*responses.Subsonic, error) {
+	id, err := req.Params(r).String("id")
+	if err != nil {
+		return nil, err
+	}
+
+	mediaFile, err := api.ds.MediaFile(r.Context()).Get(id)
+	if err != nil {
+		return nil, err
+	}
+
+	lyrics, err := mediaFile.StructuredLyrics()
+	if err != nil {
+		return nil, err
+	}
+
+	response := newResponse()
+	response.LyricsList = buildLyricsList(mediaFile, lyrics)
 
 	return response, nil
 }

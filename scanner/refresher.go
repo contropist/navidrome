@@ -3,15 +3,16 @@ package scanner
 import (
 	"context"
 	"fmt"
+	"maps"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/Masterminds/squirrel"
+	"github.com/navidrome/navidrome/consts"
 	"github.com/navidrome/navidrome/core/artwork"
 	"github.com/navidrome/navidrome/log"
 	"github.com/navidrome/navidrome/model"
-	"github.com/navidrome/navidrome/utils"
 	"github.com/navidrome/navidrome/utils/slice"
 )
 
@@ -22,15 +23,17 @@ import (
 // The actual mappings happen in MediaFiles.ToAlbum() and Albums.ToAlbumArtist()
 type refresher struct {
 	ds          model.DataStore
+	lib         model.Library
 	album       map[string]struct{}
 	artist      map[string]struct{}
 	dirMap      dirMap
 	cacheWarmer artwork.CacheWarmer
 }
 
-func newRefresher(ds model.DataStore, cw artwork.CacheWarmer, dirMap dirMap) *refresher {
+func newRefresher(ds model.DataStore, cw artwork.CacheWarmer, lib model.Library, dirMap dirMap) *refresher {
 	return &refresher{
 		ds:          ds,
+		lib:         lib,
 		album:       map[string]struct{}{},
 		artist:      map[string]struct{}{},
 		dirMap:      dirMap,
@@ -52,11 +55,11 @@ func (r *refresher) flush(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	r.album = map[string]struct{}{}
 	err = r.flushMap(ctx, r.artist, "artist", r.refreshArtists)
 	if err != nil {
 		return err
 	}
-	r.album = map[string]struct{}{}
 	r.artist = map[string]struct{}{}
 	return nil
 }
@@ -67,13 +70,8 @@ func (r *refresher) flushMap(ctx context.Context, m map[string]struct{}, entity 
 	if len(m) == 0 {
 		return nil
 	}
-	var ids []string
-	for id := range m {
-		ids = append(ids, id)
-		delete(m, id)
-	}
-	chunks := utils.BreakUpStringSlice(ids, 100)
-	for _, chunk := range chunks {
+
+	for chunk := range slice.CollectChunks(maps.Keys(m), 200) {
 		err := refresh(ctx, chunk...)
 		if err != nil {
 			log.Error(ctx, fmt.Sprintf("Error writing %ss to the DB", entity), err)
@@ -102,6 +100,7 @@ func (r *refresher) refreshAlbums(ctx context.Context, ids ...string) error {
 		if updatedAt.After(a.UpdatedAt) {
 			a.UpdatedAt = updatedAt
 		}
+		a.LibraryID = r.lib.ID
 		err := repo.Put(&a)
 		if err != nil {
 			return err
@@ -123,7 +122,7 @@ func (r *refresher) getImageFiles(dirs []string) (string, time.Time) {
 			updatedAt = stats.ImagesUpdatedAt
 		}
 	}
-	return strings.Join(imageFiles, string(filepath.ListSeparator)), updatedAt
+	return strings.Join(imageFiles, consts.Zwsp), updatedAt
 }
 
 func (r *refresher) refreshArtists(ctx context.Context, ids ...string) error {
@@ -136,13 +135,26 @@ func (r *refresher) refreshArtists(ctx context.Context, ids ...string) error {
 	}
 
 	repo := r.ds.Artist(ctx)
+	libRepo := r.ds.Library(ctx)
 	grouped := slice.Group(albums, func(al model.Album) string { return al.AlbumArtistID })
 	for _, group := range grouped {
 		a := model.Albums(group).ToAlbumArtist()
-		err := repo.Put(&a)
+
+		// Force an external metadata lookup on next access
+		a.ExternalInfoUpdatedAt = &time.Time{}
+
+		// Do not remove old metadata
+		err := repo.Put(&a, "album_count", "genres", "external_info_updated_at", "mbz_artist_id", "name", "order_artist_name", "size", "sort_artist_name", "song_count")
 		if err != nil {
 			return err
 		}
+
+		// Link the artist to the current library being scanned
+		err = libRepo.AddArtist(r.lib.ID, a.ID)
+		if err != nil {
+			return err
+		}
+		r.cacheWarmer.PreCache(a.CoverArtID())
 	}
 	return nil
 }

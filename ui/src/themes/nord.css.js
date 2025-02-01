@@ -1,4 +1,4 @@
-module.exports = `
+const stylesheet = `
 
 .react-jinke-music-player-main svg:active, .react-jinke-music-player-main svg:hover {
     color: #81A1C1
@@ -109,7 +109,7 @@ module.exports = `
 
 .react-jinke-music-player-main .music-player-lyric {
     color: #D8DEE9;
-    -webkit-text-stroke: 2px #2E3440;
+    -webkit-text-stroke: 0.5px #2E3440;
     font-weight: bolder;
 }
 
@@ -163,5 +163,6 @@ module.exports = `
 .react-jinke-music-player-mobile-progress .rc-slider-handle {
     border: none;
 }
-
 `
+
+export default stylesheet

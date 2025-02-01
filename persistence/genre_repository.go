@@ -3,8 +3,10 @@ package persistence
 import (
 	"context"
 
+	"github.com/google/uuid"
+	"github.com/pocketbase/dbx"
+
 	. "github.com/Masterminds/squirrel"
-	"github.com/beego/beego/v2/client/orm"
 	"github.com/deluan/rest"
 	"github.com/navidrome/navidrome/log"
 	"github.com/navidrome/navidrome/model"
@@ -12,22 +14,25 @@ import (
 
 type genreRepository struct {
 	sqlRepository
-	sqlRestful
 }
 
-func NewGenreRepository(ctx context.Context, o orm.QueryExecutor) model.GenreRepository {
+func NewGenreRepository(ctx context.Context, db dbx.Builder) model.GenreRepository {
 	r := &genreRepository{}
 	r.ctx = ctx
-	r.ormer = o
-	r.tableName = "genre"
-	r.filterMappings = map[string]filterFunc{
-		"name": containsFilter,
-	}
+	r.db = db
+	r.registerModel(&model.Genre{}, map[string]filterFunc{
+		"name": containsFilter("name"),
+	})
 	return r
 }
 
 func (r *genreRepository) GetAll(opt ...model.QueryOptions) (model.Genres, error) {
-	sq := r.newSelect(opt...).Columns("genre.id", "genre.name", "a.album_count", "m.song_count").
+	sq := r.newSelect(opt...).Columns(
+		"genre.id",
+		"genre.name",
+		"coalesce(a.album_count, 0) as album_count",
+		"coalesce(m.song_count, 0) as song_count",
+	).
 		LeftJoin("(select ag.genre_id, count(ag.album_id) as album_count from album_genres ag group by ag.genre_id) a on a.genre_id = genre.id").
 		LeftJoin("(select mg.genre_id, count(mg.media_file_id) as song_count from media_file_genres mg group by mg.genre_id) m on m.genre_id = genre.id")
 	res := model.Genres{}
@@ -35,14 +40,25 @@ func (r *genreRepository) GetAll(opt ...model.QueryOptions) (model.Genres, error
 	return res, err
 }
 
+// Put is an Upsert operation, based on the name of the genre: If the name already exists, returns its ID, or else
+// insert the new genre in the DB and returns its new created ID.
 func (r *genreRepository) Put(m *model.Genre) error {
-	id, err := r.put(m.ID, m)
-	m.ID = id
-	return err
+	if m.ID == "" {
+		m.ID = uuid.NewString()
+	}
+	sql := Insert("genre").Columns("id", "name").Values(m.ID, m.Name).
+		Suffix("on conflict (name) do update set name=excluded.name returning id")
+	resp := model.Genre{}
+	err := r.queryOne(sql, &resp)
+	if err != nil {
+		return err
+	}
+	m.ID = resp.ID
+	return nil
 }
 
 func (r *genreRepository) Count(options ...rest.QueryOptions) (int64, error) {
-	return r.count(Select(), r.parseRestOptions(options...))
+	return r.count(Select(), r.parseRestOptions(r.ctx, options...))
 }
 
 func (r *genreRepository) Read(id string) (interface{}, error) {
@@ -53,7 +69,7 @@ func (r *genreRepository) Read(id string) (interface{}, error) {
 }
 
 func (r *genreRepository) ReadAll(options ...rest.QueryOptions) (interface{}, error) {
-	sel := r.newSelect(r.parseRestOptions(options...)).Columns("*")
+	sel := r.newSelect(r.parseRestOptions(r.ctx, options...)).Columns("*")
 	res := model.Genres{}
 	err := r.queryAll(sel, &res)
 	return res, err

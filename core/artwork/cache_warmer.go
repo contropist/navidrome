@@ -4,16 +4,18 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/navidrome/navidrome/conf"
+	"github.com/navidrome/navidrome/consts"
 	"github.com/navidrome/navidrome/log"
 	"github.com/navidrome/navidrome/model"
 	"github.com/navidrome/navidrome/model/request"
 	"github.com/navidrome/navidrome/utils/cache"
 	"github.com/navidrome/navidrome/utils/pl"
-	"golang.org/x/exp/maps"
 )
 
 type CacheWarmer interface {
@@ -22,14 +24,14 @@ type CacheWarmer interface {
 
 func NewCacheWarmer(artwork Artwork, cache cache.FileCache) CacheWarmer {
 	// If image cache is disabled, return a NOOP implementation
-	if conf.Server.ImageCacheSize == "0" {
+	if conf.Server.ImageCacheSize == "0" || !conf.Server.EnableArtworkPrecache {
 		return &noopCacheWarmer{}
 	}
 
 	a := &cacheWarmer{
 		artwork:    artwork,
 		cache:      cache,
-		buffer:     make(map[string]struct{}),
+		buffer:     make(map[model.ArtworkID]struct{}),
 		wakeSignal: make(chan struct{}, 1),
 	}
 
@@ -41,16 +43,24 @@ func NewCacheWarmer(artwork Artwork, cache cache.FileCache) CacheWarmer {
 
 type cacheWarmer struct {
 	artwork    Artwork
-	buffer     map[string]struct{}
+	buffer     map[model.ArtworkID]struct{}
 	mutex      sync.Mutex
 	cache      cache.FileCache
 	wakeSignal chan struct{}
 }
 
+var ignoredIds = map[string]struct{}{
+	consts.VariousArtistsID: {},
+	consts.UnknownArtistID:  {},
+}
+
 func (a *cacheWarmer) PreCache(artID model.ArtworkID) {
+	if _, shouldIgnore := ignoredIds[artID.ID]; shouldIgnore {
+		return
+	}
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
-	a.buffer[artID.String()] = struct{}{}
+	a.buffer[artID] = struct{}{}
 	a.sendWakeSignal()
 }
 
@@ -64,10 +74,10 @@ func (a *cacheWarmer) sendWakeSignal() {
 
 func (a *cacheWarmer) run(ctx context.Context) {
 	for {
-		time.AfterFunc(10*time.Second, func() {
-			a.sendWakeSignal()
-		})
-		<-a.wakeSignal
+		a.waitSignal(ctx, 10*time.Second)
+		if ctx.Err() != nil {
+			break
+		}
 
 		// If cache not available, keep waiting
 		if !a.cache.Available(ctx) {
@@ -85,27 +95,44 @@ func (a *cacheWarmer) run(ctx context.Context) {
 			continue
 		}
 
-		batch := maps.Keys(a.buffer)
-		a.buffer = make(map[string]struct{})
+		batch := slices.Collect(maps.Keys(a.buffer))
+		a.buffer = make(map[model.ArtworkID]struct{})
 		a.mutex.Unlock()
 
 		a.processBatch(ctx, batch)
 	}
 }
 
-func (a *cacheWarmer) processBatch(ctx context.Context, batch []string) {
+func (a *cacheWarmer) waitSignal(ctx context.Context, timeout time.Duration) {
+	var to <-chan time.Time
+	if !a.cache.Available(ctx) {
+		tmr := time.NewTimer(timeout)
+		defer tmr.Stop()
+		to = tmr.C
+	}
+	select {
+	case <-to:
+	case <-a.wakeSignal:
+	case <-ctx.Done():
+	}
+}
+
+func (a *cacheWarmer) processBatch(ctx context.Context, batch []model.ArtworkID) {
 	log.Trace(ctx, "PreCaching a new batch of artwork", "batchSize", len(batch))
 	input := pl.FromSlice(ctx, batch)
 	errs := pl.Sink(ctx, 2, input, a.doCacheImage)
 	for err := range errs {
-		log.Warn(ctx, "Error warming cache", err)
+		log.Debug(ctx, "Error warming cache", err)
 	}
 }
 
-func (a *cacheWarmer) doCacheImage(ctx context.Context, id string) error {
-	r, _, err := a.artwork.Get(ctx, id, 0)
+func (a *cacheWarmer) doCacheImage(ctx context.Context, id model.ArtworkID) error {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	r, _, err := a.artwork.Get(ctx, id, consts.UICoverArtSize, true)
 	if err != nil {
-		return fmt.Errorf("error cacheing id='%s': %w", id, err)
+		return fmt.Errorf("caching id='%s': %w", id, err)
 	}
 	defer r.Close()
 	_, err = io.Copy(io.Discard, r)

@@ -25,11 +25,11 @@ type httpDoer interface {
 	Do(req *http.Request) (*http.Response, error)
 }
 
-func NewClient(baseURL string, hc httpDoer) *Client {
-	return &Client{baseURL, hc}
+func newClient(baseURL string, hc httpDoer) *client {
+	return &client{baseURL, hc}
 }
 
-type Client struct {
+type client struct {
 	baseURL string
 	hc      httpDoer
 }
@@ -76,12 +76,13 @@ type additionalInfo struct {
 	SubmissionClient        string   `json:"submission_client,omitempty"`
 	SubmissionClientVersion string   `json:"submission_client_version,omitempty"`
 	TrackNumber             int      `json:"tracknumber,omitempty"`
-	TrackMbzID              string   `json:"track_mbid,omitempty"`
+	RecordingMbzID          string   `json:"recording_mbid,omitempty"`
 	ArtistMbzIDs            []string `json:"artist_mbids,omitempty"`
 	ReleaseMbID             string   `json:"release_mbid,omitempty"`
+	DurationMs              int      `json:"duration_ms,omitempty"`
 }
 
-func (c *Client) ValidateToken(ctx context.Context, apiKey string) (*listenBrainzResponse, error) {
+func (c *client) validateToken(ctx context.Context, apiKey string) (*listenBrainzResponse, error) {
 	r := &listenBrainzRequest{
 		ApiKey: apiKey,
 	}
@@ -92,7 +93,7 @@ func (c *Client) ValidateToken(ctx context.Context, apiKey string) (*listenBrain
 	return response, nil
 }
 
-func (c *Client) UpdateNowPlaying(ctx context.Context, apiKey string, li listenInfo) error {
+func (c *client) updateNowPlaying(ctx context.Context, apiKey string, li listenInfo) error {
 	r := &listenBrainzRequest{
 		ApiKey: apiKey,
 		Body: listenBrainzRequestBody{
@@ -111,7 +112,7 @@ func (c *Client) UpdateNowPlaying(ctx context.Context, apiKey string, li listenI
 	return nil
 }
 
-func (c *Client) Scrobble(ctx context.Context, apiKey string, li listenInfo) error {
+func (c *client) scrobble(ctx context.Context, apiKey string, li listenInfo) error {
 	r := &listenBrainzRequest{
 		ApiKey: apiKey,
 		Body: listenBrainzRequestBody{
@@ -129,7 +130,7 @@ func (c *Client) Scrobble(ctx context.Context, apiKey string, li listenInfo) err
 	return nil
 }
 
-func (c *Client) path(endpoint string) (string, error) {
+func (c *client) path(endpoint string) (string, error) {
 	u, err := url.Parse(c.baseURL)
 	if err != nil {
 		return "", err
@@ -138,7 +139,7 @@ func (c *Client) path(endpoint string) (string, error) {
 	return u.String(), nil
 }
 
-func (c *Client) makeRequest(ctx context.Context, method string, endpoint string, r *listenBrainzRequest) (*listenBrainzResponse, error) {
+func (c *client) makeRequest(ctx context.Context, method string, endpoint string, r *listenBrainzRequest) (*listenBrainzResponse, error) {
 	b, _ := json.Marshal(r.Body)
 	uri, err := c.path(endpoint)
 	if err != nil {
@@ -151,6 +152,7 @@ func (c *Client) makeRequest(ctx context.Context, method string, endpoint string
 		req.Header.Add("Authorization", fmt.Sprintf("Token %s", r.ApiKey))
 	}
 
+	log.Trace(ctx, fmt.Sprintf("Sending ListenBrainz %s request", req.Method), "url", req.URL)
 	resp, err := c.hc.Do(req)
 	if err != nil {
 		return nil, err

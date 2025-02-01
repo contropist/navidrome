@@ -2,10 +2,8 @@ package core
 
 import (
 	"context"
-	"os"
 
 	"github.com/navidrome/navidrome/conf"
-	"github.com/navidrome/navidrome/conf/configtest"
 	"github.com/navidrome/navidrome/log"
 	"github.com/navidrome/navidrome/model"
 	"github.com/navidrome/navidrome/model/request"
@@ -16,21 +14,10 @@ import (
 
 var _ = Describe("MediaStreamer", func() {
 	var ds model.DataStore
-	ctx := log.NewContext(context.TODO())
+	ctx := log.NewContext(context.Background())
 
 	BeforeEach(func() {
-		DeferCleanup(configtest.SetupConfig())
-		conf.Server.DataFolder, _ = os.MkdirTemp("", "file_caches")
-		conf.Server.TranscodingCacheSize = "100MB"
 		ds = &tests.MockDataStore{MockedTranscoding: &tests.MockTranscodingRepo{}}
-		ds.MediaFile(ctx).(*tests.MockMediaFileRepo).SetData(model.MediaFiles{
-			{ID: "123", Path: "tests/fixtures/test.mp3", Suffix: "mp3", BitRate: 128, Duration: 257.0},
-		})
-		testCache := GetTranscodingCache()
-		Eventually(func() bool { return testCache.Ready(context.TODO()) }).Should(BeTrue())
-	})
-	AfterEach(func() {
-		_ = os.RemoveAll(conf.Server.DataFolder)
 	})
 
 	Context("selectTranscodingOptions", func() {
@@ -75,14 +62,23 @@ var _ = Describe("MediaStreamer", func() {
 				Expect(format).To(Equal("raw"))
 				Expect(bitRate).To(Equal(320))
 			})
-			It("returns the DefaultDownsamplingFormat if a maxBitrate but not the format", func() {
-				conf.Server.DefaultDownsamplingFormat = "opus"
-				mf.Suffix = "FLAC"
-				mf.BitRate = 960
-				format, bitRate := selectTranscodingOptions(ctx, ds, mf, "", 128)
-				Expect(format).To(Equal("opus"))
-				Expect(bitRate).To(Equal(128))
-
+			Context("Downsampling", func() {
+				BeforeEach(func() {
+					conf.Server.DefaultDownsamplingFormat = "opus"
+					mf.Suffix = "FLAC"
+					mf.BitRate = 960
+				})
+				It("returns the DefaultDownsamplingFormat if a maxBitrate is requested but not the format", func() {
+					format, bitRate := selectTranscodingOptions(ctx, ds, mf, "", 128)
+					Expect(format).To(Equal("opus"))
+					Expect(bitRate).To(Equal(128))
+				})
+				It("returns raw if maxBitrate is equal or greater than original", func() {
+					// This happens with DSub (and maybe other clients?). See https://github.com/navidrome/navidrome/issues/2066
+					format, bitRate := selectTranscodingOptions(ctx, ds, mf, "", 960)
+					Expect(format).To(Equal("raw"))
+					Expect(bitRate).To(Equal(0))
+				})
 			})
 		})
 
@@ -126,10 +122,11 @@ var _ = Describe("MediaStreamer", func() {
 				Expect(bitRate).To(Equal(0))
 			})
 		})
+
 		Context("player has maxBitRate configured", func() {
 			BeforeEach(func() {
 				t := model.Transcoding{ID: "oga1", TargetFormat: "oga", DefaultBitRate: 96}
-				p := model.Player{ID: "player1", TranscodingId: t.ID, MaxBitRate: 80}
+				p := model.Player{ID: "player1", TranscodingId: t.ID, MaxBitRate: 192}
 				ctx = request.WithTranscoding(ctx, t)
 				ctx = request.WithPlayer(ctx, p)
 			})
@@ -144,7 +141,7 @@ var _ = Describe("MediaStreamer", func() {
 				mf.BitRate = 1000
 				format, bitRate := selectTranscodingOptions(ctx, ds, mf, "", 0)
 				Expect(format).To(Equal("oga"))
-				Expect(bitRate).To(Equal(80))
+				Expect(bitRate).To(Equal(192))
 			})
 			It("returns requested format", func() {
 				mf.Suffix = "flac"
@@ -156,9 +153,9 @@ var _ = Describe("MediaStreamer", func() {
 			It("returns requested bitrate", func() {
 				mf.Suffix = "flac"
 				mf.BitRate = 1000
-				format, bitRate := selectTranscodingOptions(ctx, ds, mf, "", 80)
+				format, bitRate := selectTranscodingOptions(ctx, ds, mf, "", 160)
 				Expect(format).To(Equal("oga"))
-				Expect(bitRate).To(Equal(80))
+				Expect(bitRate).To(Equal(160))
 			})
 		})
 	})

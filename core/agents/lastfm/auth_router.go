@@ -18,7 +18,7 @@ import (
 	"github.com/navidrome/navidrome/model"
 	"github.com/navidrome/navidrome/model/request"
 	"github.com/navidrome/navidrome/server"
-	"github.com/navidrome/navidrome/utils"
+	"github.com/navidrome/navidrome/utils/req"
 )
 
 //go:embed token_received.html
@@ -28,7 +28,7 @@ type Router struct {
 	http.Handler
 	ds          model.DataStore
 	sessionKeys *agents.SessionKeys
-	client      *Client
+	client      *client
 	apiKey      string
 	secret      string
 }
@@ -44,7 +44,7 @@ func NewRouter(ds model.DataStore) *Router {
 	hc := &http.Client{
 		Timeout: consts.DefaultHttpClientTimeOut,
 	}
-	r.client = NewClient(r.apiKey, r.secret, "en", hc)
+	r.client = newClient(r.apiKey, r.secret, "en", hc)
 	return r
 }
 
@@ -65,7 +65,9 @@ func (s *Router) routes() http.Handler {
 }
 
 func (s *Router) getLinkStatus(w http.ResponseWriter, r *http.Request) {
-	resp := map[string]interface{}{}
+	resp := map[string]interface{}{
+		"apiKey": s.apiKey,
+	}
 	u, _ := request.UserFrom(r.Context())
 	key, err := s.sessionKeys.Get(r.Context(), u.ID)
 	if err != nil && !errors.Is(err, model.ErrNotFound) {
@@ -89,13 +91,14 @@ func (s *Router) unlink(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Router) callback(w http.ResponseWriter, r *http.Request) {
-	token := utils.ParamString(r, "token")
-	if token == "" {
+	p := req.Params(r)
+	token, err := p.String("token")
+	if err != nil {
 		_ = rest.RespondWithError(w, http.StatusBadRequest, "token not received")
 		return
 	}
-	uid := utils.ParamString(r, "uid")
-	if uid == "" {
+	uid, err := p.String("uid")
+	if err != nil {
 		_ = rest.RespondWithError(w, http.StatusBadRequest, "uid not received")
 		return
 	}
@@ -103,7 +106,7 @@ func (s *Router) callback(w http.ResponseWriter, r *http.Request) {
 	// Need to add user to context, as this is a non-authenticated endpoint, so it does not
 	// automatically contain any user info
 	ctx := request.WithUser(r.Context(), model.User{ID: uid})
-	err := s.fetchSessionKey(ctx, uid, token)
+	err = s.fetchSessionKey(ctx, uid, token)
 	if err != nil {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusBadRequest)
@@ -115,7 +118,7 @@ func (s *Router) callback(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Router) fetchSessionKey(ctx context.Context, uid, token string) error {
-	sessionKey, err := s.client.GetSession(ctx, token)
+	sessionKey, err := s.client.getSession(ctx, token)
 	if err != nil {
 		log.Error(ctx, "Could not fetch LastFM session key", "userId", uid, "token", token,
 			"requestId", middleware.GetReqID(ctx), err)

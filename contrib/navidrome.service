@@ -11,14 +11,12 @@ WantedBy=multi-user.target
 User=navidrome
 Group=navidrome
 Type=simple
-ExecStart=/usr/bin/navidrome
+ExecStart=/usr/bin/navidrome --configfile "/etc/navidrome/navidrome.toml"
 StateDirectory=navidrome
 WorkingDirectory=/var/lib/navidrome
 TimeoutStopSec=20
 KillMode=process
 Restart=on-failure
-
-EnvironmentFile=-/etc/sysconfig/navidrome
 
 # See https://www.freedesktop.org/software/systemd/man/systemd.exec.html
 CapabilityBoundingSet=
@@ -38,6 +36,7 @@ RestrictNamespaces=yes
 RestrictRealtime=yes
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
+SystemCallFilter=setrlimit
 SystemCallArchitectures=native
 UMask=0066
 

@@ -2,14 +2,14 @@ package core
 
 import (
 	"context"
+	"errors"
+	"net/url"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/Masterminds/squirrel"
-	"github.com/deluan/sanitize"
-	"github.com/navidrome/navidrome/consts"
+	"github.com/navidrome/navidrome/conf"
 	"github.com/navidrome/navidrome/core/agents"
 	_ "github.com/navidrome/navidrome/core/agents/lastfm"
 	_ "github.com/navidrome/navidrome/core/agents/listenbrainz"
@@ -17,23 +17,39 @@ import (
 	"github.com/navidrome/navidrome/log"
 	"github.com/navidrome/navidrome/model"
 	"github.com/navidrome/navidrome/utils"
-	"github.com/navidrome/navidrome/utils/number"
+	. "github.com/navidrome/navidrome/utils/gg"
+	"github.com/navidrome/navidrome/utils/random"
+	"github.com/navidrome/navidrome/utils/str"
+	"golang.org/x/sync/errgroup"
 )
 
 const (
 	unavailableArtistID = "-1"
 	maxSimilarArtists   = 100
+	refreshDelay        = 5 * time.Second
+	refreshTimeout      = 15 * time.Second
+	refreshQueueLength  = 2000
 )
 
 type ExternalMetadata interface {
+	UpdateAlbumInfo(ctx context.Context, id string) (*model.Album, error)
 	UpdateArtistInfo(ctx context.Context, id string, count int, includeNotPresent bool) (*model.Artist, error)
 	SimilarSongs(ctx context.Context, id string, count int) (model.MediaFiles, error)
 	TopSongs(ctx context.Context, artist string, count int) (model.MediaFiles, error)
+	ArtistImage(ctx context.Context, id string) (*url.URL, error)
+	AlbumImage(ctx context.Context, id string) (*url.URL, error)
 }
 
 type externalMetadata struct {
-	ds model.DataStore
-	ag *agents.Agents
+	ds          model.DataStore
+	ag          *agents.Agents
+	artistQueue refreshQueue[auxArtist]
+	albumQueue  refreshQueue[auxAlbum]
+}
+
+type auxAlbum struct {
+	model.Album
+	Name string
 }
 
 type auxArtist struct {
@@ -42,116 +58,192 @@ type auxArtist struct {
 }
 
 func NewExternalMetadata(ds model.DataStore, agents *agents.Agents) ExternalMetadata {
-	return &externalMetadata{ds: ds, ag: agents}
+	e := &externalMetadata{ds: ds, ag: agents}
+	e.artistQueue = newRefreshQueue(context.TODO(), e.populateArtistInfo)
+	e.albumQueue = newRefreshQueue(context.TODO(), e.populateAlbumInfo)
+	return e
 }
 
-func (e *externalMetadata) getArtist(ctx context.Context, id string) (*auxArtist, error) {
+func (e *externalMetadata) getAlbum(ctx context.Context, id string) (auxAlbum, error) {
 	var entity interface{}
 	entity, err := model.GetEntityByID(ctx, e.ds, id)
 	if err != nil {
+		return auxAlbum{}, err
+	}
+
+	var album auxAlbum
+	switch v := entity.(type) {
+	case *model.Album:
+		album.Album = *v
+		album.Name = str.Clear(v.Name)
+	case *model.MediaFile:
+		return e.getAlbum(ctx, v.AlbumID)
+	default:
+		return auxAlbum{}, model.ErrNotFound
+	}
+	return album, nil
+}
+
+func (e *externalMetadata) UpdateAlbumInfo(ctx context.Context, id string) (*model.Album, error) {
+	album, err := e.getAlbum(ctx, id)
+	if err != nil {
+		log.Info(ctx, "Not found", "id", id)
 		return nil, err
+	}
+
+	updatedAt := V(album.ExternalInfoUpdatedAt)
+	if updatedAt.IsZero() {
+		log.Debug(ctx, "AlbumInfo not cached. Retrieving it now", "updatedAt", updatedAt, "id", id, "name", album.Name)
+		album, err = e.populateAlbumInfo(ctx, album)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// If info is expired, trigger a populateAlbumInfo in the background
+	if time.Since(updatedAt) > conf.Server.DevAlbumInfoTimeToLive {
+		log.Debug("Found expired cached AlbumInfo, refreshing in the background", "updatedAt", album.ExternalInfoUpdatedAt, "name", album.Name)
+		e.albumQueue.enqueue(&album)
+	}
+
+	return &album.Album, nil
+}
+
+func (e *externalMetadata) populateAlbumInfo(ctx context.Context, album auxAlbum) (auxAlbum, error) {
+	start := time.Now()
+	info, err := e.ag.GetAlbumInfo(ctx, album.Name, album.AlbumArtist, album.MbzAlbumID)
+	if errors.Is(err, agents.ErrNotFound) {
+		return album, nil
+	}
+	if err != nil {
+		log.Error("Error refreshing AlbumInfo", "id", album.ID, "name", album.Name, "artist", album.AlbumArtist,
+			"elapsed", time.Since(start), err)
+		return album, err
+	}
+
+	album.ExternalInfoUpdatedAt = P(time.Now())
+	album.ExternalUrl = info.URL
+
+	if info.Description != "" {
+		album.Description = info.Description
+	}
+
+	if len(info.Images) > 0 {
+		sort.Slice(info.Images, func(i, j int) bool {
+			return info.Images[i].Size > info.Images[j].Size
+		})
+
+		album.LargeImageUrl = info.Images[0].URL
+
+		if len(info.Images) >= 2 {
+			album.MediumImageUrl = info.Images[1].URL
+		}
+
+		if len(info.Images) >= 3 {
+			album.SmallImageUrl = info.Images[2].URL
+		}
+	}
+
+	err = e.ds.Album(ctx).Put(&album.Album)
+	if err != nil {
+		log.Error(ctx, "Error trying to update album external information", "id", album.ID, "name", album.Name,
+			"elapsed", time.Since(start), err)
+	} else {
+		log.Trace(ctx, "AlbumInfo collected", "album", album, "elapsed", time.Since(start))
+	}
+
+	return album, nil
+}
+
+func (e *externalMetadata) getArtist(ctx context.Context, id string) (auxArtist, error) {
+	var entity interface{}
+	entity, err := model.GetEntityByID(ctx, e.ds, id)
+	if err != nil {
+		return auxArtist{}, err
 	}
 
 	var artist auxArtist
 	switch v := entity.(type) {
 	case *model.Artist:
 		artist.Artist = *v
-		artist.Name = clearName(v.Name)
+		artist.Name = str.Clear(v.Name)
 	case *model.MediaFile:
 		return e.getArtist(ctx, v.ArtistID)
 	case *model.Album:
 		return e.getArtist(ctx, v.AlbumArtistID)
 	default:
-		return nil, model.ErrNotFound
+		return auxArtist{}, model.ErrNotFound
 	}
-	return &artist, nil
-}
-
-// Replace some Unicode chars with their equivalent ASCII
-func clearName(name string) string {
-	name = strings.ReplaceAll(name, "–", "-")
-	name = strings.ReplaceAll(name, "‐", "-")
-	name = strings.ReplaceAll(name, "“", `"`)
-	name = strings.ReplaceAll(name, "”", `"`)
-	name = strings.ReplaceAll(name, "‘", `'`)
-	name = strings.ReplaceAll(name, "’", `'`)
-	return name
+	return artist, nil
 }
 
 func (e *externalMetadata) UpdateArtistInfo(ctx context.Context, id string, similarCount int, includeNotPresent bool) (*model.Artist, error) {
-	artist, err := e.getArtist(ctx, id)
+	artist, err := e.refreshArtistInfo(ctx, id)
 	if err != nil {
 		return nil, err
 	}
 
-	// If we don't have any info, retrieves it now
-	if artist.ExternalInfoUpdatedAt.IsZero() {
-		log.Debug(ctx, "ArtistInfo not cached. Retrieving it now", "updatedAt", artist.ExternalInfoUpdatedAt, "id", id, "name", artist.Name)
-		err = e.refreshArtistInfo(ctx, artist)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	// If info is expired, trigger a refresh in the background
-	if time.Since(artist.ExternalInfoUpdatedAt) > consts.ArtistInfoTimeToLive {
-		log.Debug("Found expired cached ArtistInfo, refreshing in the background", "updatedAt", artist.ExternalInfoUpdatedAt, "name", artist.Name)
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-			defer cancel()
-			err := e.refreshArtistInfo(ctx, artist)
-			if err != nil {
-				log.Error("Error refreshing ArtistInfo", "id", id, "name", artist.Name, err)
-			}
-		}()
-	}
-
-	err = e.loadSimilar(ctx, artist, similarCount, includeNotPresent)
+	err = e.loadSimilar(ctx, &artist, similarCount, includeNotPresent)
 	return &artist.Artist, err
 }
 
-func (e *externalMetadata) refreshArtistInfo(ctx context.Context, artist *auxArtist) error {
+func (e *externalMetadata) refreshArtistInfo(ctx context.Context, id string) (auxArtist, error) {
+	artist, err := e.getArtist(ctx, id)
+	if err != nil {
+		return auxArtist{}, err
+	}
+
+	// If we don't have any info, retrieves it now
+	updatedAt := V(artist.ExternalInfoUpdatedAt)
+	if updatedAt.IsZero() {
+		log.Debug(ctx, "ArtistInfo not cached. Retrieving it now", "updatedAt", updatedAt, "id", id, "name", artist.Name)
+		artist, err = e.populateArtistInfo(ctx, artist)
+		if err != nil {
+			return auxArtist{}, err
+		}
+	}
+
+	// If info is expired, trigger a populateArtistInfo in the background
+	if time.Since(updatedAt) > conf.Server.DevArtistInfoTimeToLive {
+		log.Debug("Found expired cached ArtistInfo, refreshing in the background", "updatedAt", updatedAt, "name", artist.Name)
+		e.artistQueue.enqueue(&artist)
+	}
+	return artist, nil
+}
+
+func (e *externalMetadata) populateArtistInfo(ctx context.Context, artist auxArtist) (auxArtist, error) {
+	start := time.Now()
 	// Get MBID first, if it is not yet available
 	if artist.MbzArtistID == "" {
-		mbid, err := e.ag.GetMBID(ctx, artist.ID, artist.Name)
+		mbid, err := e.ag.GetArtistMBID(ctx, artist.ID, artist.Name)
 		if mbid != "" && err == nil {
 			artist.MbzArtistID = mbid
 		}
 	}
 
 	// Call all registered agents and collect information
-	callParallel([]func(){
-		func() { e.callGetBiography(ctx, e.ag, artist) },
-		func() { e.callGetURL(ctx, e.ag, artist) },
-		func() { e.callGetImage(ctx, e.ag, artist) },
-		func() { e.callGetSimilar(ctx, e.ag, artist, maxSimilarArtists, true) },
-	})
+	g := errgroup.Group{}
+	g.SetLimit(2)
+	g.Go(func() error { e.callGetImage(ctx, e.ag, &artist); return nil })
+	g.Go(func() error { e.callGetBiography(ctx, e.ag, &artist); return nil })
+	g.Go(func() error { e.callGetURL(ctx, e.ag, &artist); return nil })
+	g.Go(func() error { e.callGetSimilar(ctx, e.ag, &artist, maxSimilarArtists, true); return nil })
+	_ = g.Wait()
 
 	if utils.IsCtxDone(ctx) {
-		log.Warn(ctx, "ArtistInfo update canceled", ctx.Err())
-		return ctx.Err()
+		log.Warn(ctx, "ArtistInfo update canceled", "elapsed", "id", artist.ID, "name", artist.Name, time.Since(start), ctx.Err())
+		return artist, ctx.Err()
 	}
 
-	artist.ExternalInfoUpdatedAt = time.Now()
+	artist.ExternalInfoUpdatedAt = P(time.Now())
 	err := e.ds.Artist(ctx).Put(&artist.Artist)
 	if err != nil {
-		log.Error(ctx, "Error trying to update artist external information", "id", artist.ID, "name", artist.Name, err)
+		log.Error(ctx, "Error trying to update artist external information", "id", artist.ID, "name", artist.Name,
+			"elapsed", time.Since(start), err)
+	} else {
+		log.Trace(ctx, "ArtistInfo collected", "artist", artist, "elapsed", time.Since(start))
 	}
-
-	log.Trace(ctx, "ArtistInfo collected", "artist", artist)
-	return nil
-}
-
-func callParallel(fs []func()) {
-	wg := &sync.WaitGroup{}
-	wg.Add(len(fs))
-	for _, f := range fs {
-		go func(f func()) {
-			f()
-			wg.Done()
-		}(f)
-	}
-	wg.Wait()
+	return artist, nil
 }
 
 func (e *externalMetadata) SimilarSongs(ctx context.Context, id string, count int) (model.MediaFiles, error) {
@@ -160,20 +252,20 @@ func (e *externalMetadata) SimilarSongs(ctx context.Context, id string, count in
 		return nil, err
 	}
 
-	e.callGetSimilar(ctx, e.ag, artist, 15, false)
+	e.callGetSimilar(ctx, e.ag, &artist, 15, false)
 	if utils.IsCtxDone(ctx) {
 		log.Warn(ctx, "SimilarSongs call canceled", ctx.Err())
 		return nil, ctx.Err()
 	}
 
-	weightedSongs := utils.NewWeightedRandomChooser()
-	addArtist := func(a model.Artist, weightedSongs *utils.WeightedChooser, count, artistWeight int) error {
+	weightedSongs := random.NewWeightedChooser[model.MediaFile]()
+	addArtist := func(a model.Artist, weightedSongs *random.WeightedChooser[model.MediaFile], count, artistWeight int) error {
 		if utils.IsCtxDone(ctx) {
 			log.Warn(ctx, "SimilarSongs call canceled", ctx.Err())
 			return ctx.Err()
 		}
 
-		topCount := number.Max(count, 20)
+		topCount := max(count, 20)
 		topSongs, err := e.getMatchingTopSongs(ctx, e.ag, &auxArtist{Name: a.Name, Artist: a}, topCount)
 		if err != nil {
 			log.Warn(ctx, "Error getting artist's top songs", "artist", a.Name, err)
@@ -182,7 +274,7 @@ func (e *externalMetadata) SimilarSongs(ctx context.Context, id string, count in
 
 		weight := topCount * (4 + artistWeight)
 		for _, mf := range topSongs {
-			weightedSongs.Put(mf, weight)
+			weightedSongs.Add(mf, weight)
 			weight -= 4
 		}
 		return nil
@@ -201,15 +293,62 @@ func (e *externalMetadata) SimilarSongs(ctx context.Context, id string, count in
 
 	var similarSongs model.MediaFiles
 	for len(similarSongs) < count && weightedSongs.Size() > 0 {
-		s, err := weightedSongs.GetAndRemove()
+		s, err := weightedSongs.Pick()
 		if err != nil {
 			log.Warn(ctx, "Error getting weighted song", err)
 			continue
 		}
-		similarSongs = append(similarSongs, s.(model.MediaFile))
+		similarSongs = append(similarSongs, s)
 	}
 
 	return similarSongs, nil
+}
+
+func (e *externalMetadata) ArtistImage(ctx context.Context, id string) (*url.URL, error) {
+	artist, err := e.getArtist(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+
+	e.callGetImage(ctx, e.ag, &artist)
+	if utils.IsCtxDone(ctx) {
+		log.Warn(ctx, "ArtistImage call canceled", ctx.Err())
+		return nil, ctx.Err()
+	}
+
+	imageUrl := artist.ArtistImageUrl()
+	if imageUrl == "" {
+		return nil, agents.ErrNotFound
+	}
+	return url.Parse(imageUrl)
+}
+
+func (e *externalMetadata) AlbumImage(ctx context.Context, id string) (*url.URL, error) {
+	album, err := e.getAlbum(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+
+	info, err := e.ag.GetAlbumInfo(ctx, album.Name, album.AlbumArtist, album.MbzAlbumID)
+	if errors.Is(err, agents.ErrNotFound) {
+		return nil, err
+	}
+	if utils.IsCtxDone(ctx) {
+		log.Warn(ctx, "AlbumImage call canceled", ctx.Err())
+		return nil, ctx.Err()
+	}
+
+	// Return the biggest image
+	var img agents.ExternalImage
+	for _, i := range info.Images {
+		if img.Size <= i.Size {
+			img = i
+		}
+	}
+	if img.URL == "" {
+		return nil, agents.ErrNotFound
+	}
+	return url.Parse(img.URL)
 }
 
 func (e *externalMetadata) TopSongs(ctx context.Context, artistName string, count int) (model.MediaFiles, error) {
@@ -223,7 +362,10 @@ func (e *externalMetadata) TopSongs(ctx context.Context, artistName string, coun
 }
 
 func (e *externalMetadata) getMatchingTopSongs(ctx context.Context, agent agents.ArtistTopSongsRetriever, artist *auxArtist, count int) (model.MediaFiles, error) {
-	songs, err := agent.GetTopSongs(ctx, artist.ID, artist.Name, artist.MbzArtistID, count)
+	songs, err := agent.GetArtistTopSongs(ctx, artist.ID, artist.Name, artist.MbzArtistID, count)
+	if errors.Is(err, agents.ErrNotFound) {
+		return nil, nil
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -250,7 +392,7 @@ func (e *externalMetadata) getMatchingTopSongs(ctx context.Context, agent agents
 func (e *externalMetadata) findMatchingTrack(ctx context.Context, mbid string, artistID, title string) (*model.MediaFile, error) {
 	if mbid != "" {
 		mfs, err := e.ds.MediaFile(ctx).GetAll(model.QueryOptions{
-			Filters: squirrel.Eq{"mbz_track_id": mbid},
+			Filters: squirrel.Eq{"mbz_recording_id": mbid},
 		})
 		if err == nil && len(mfs) > 0 {
 			return &mfs[0], nil
@@ -263,9 +405,9 @@ func (e *externalMetadata) findMatchingTrack(ctx context.Context, mbid string, a
 				squirrel.Eq{"artist_id": artistID},
 				squirrel.Eq{"album_artist_id": artistID},
 			},
-			squirrel.Like{"order_title": strings.TrimSpace(sanitize.Accents(title))},
+			squirrel.Like{"order_title": str.SanitizeFieldForSorting(title)},
 		},
-		Sort: "starred desc, rating desc, year asc",
+		Sort: "starred desc, rating desc, year asc, compilation asc ",
 		Max:  1,
 	})
 	if err != nil || len(mfs) == 0 {
@@ -275,26 +417,26 @@ func (e *externalMetadata) findMatchingTrack(ctx context.Context, mbid string, a
 }
 
 func (e *externalMetadata) callGetURL(ctx context.Context, agent agents.ArtistURLRetriever, artist *auxArtist) {
-	url, err := agent.GetURL(ctx, artist.ID, artist.Name, artist.MbzArtistID)
-	if url == "" || err != nil {
+	artisURL, err := agent.GetArtistURL(ctx, artist.ID, artist.Name, artist.MbzArtistID)
+	if err != nil {
 		return
 	}
-	artist.ExternalUrl = url
+	artist.ExternalUrl = artisURL
 }
 
 func (e *externalMetadata) callGetBiography(ctx context.Context, agent agents.ArtistBiographyRetriever, artist *auxArtist) {
-	bio, err := agent.GetBiography(ctx, artist.ID, clearName(artist.Name), artist.MbzArtistID)
-	if bio == "" || err != nil {
+	bio, err := agent.GetArtistBiography(ctx, artist.ID, str.Clear(artist.Name), artist.MbzArtistID)
+	if err != nil {
 		return
 	}
-	bio = utils.SanitizeText(bio)
+	bio = str.SanitizeText(bio)
 	bio = strings.ReplaceAll(bio, "\n", " ")
 	artist.Biography = strings.ReplaceAll(bio, "<a ", "<a target='_blank' ")
 }
 
 func (e *externalMetadata) callGetImage(ctx context.Context, agent agents.ArtistImageRetriever, artist *auxArtist) {
-	images, err := agent.GetImages(ctx, artist.ID, artist.Name, artist.MbzArtistID)
-	if len(images) == 0 || err != nil {
+	images, err := agent.GetArtistImages(ctx, artist.ID, artist.Name, artist.MbzArtistID)
+	if err != nil {
 		return
 	}
 	sort.Slice(images, func(i, j int) bool { return images[i].Size > images[j].Size })
@@ -312,11 +454,13 @@ func (e *externalMetadata) callGetImage(ctx context.Context, agent agents.Artist
 
 func (e *externalMetadata) callGetSimilar(ctx context.Context, agent agents.ArtistSimilarRetriever, artist *auxArtist,
 	limit int, includeNotPresent bool) {
-	similar, err := agent.GetSimilar(ctx, artist.ID, artist.Name, artist.MbzArtistID, limit)
+	similar, err := agent.GetSimilarArtists(ctx, artist.ID, artist.Name, artist.MbzArtistID, limit)
 	if len(similar) == 0 || err != nil {
 		return
 	}
+	start := time.Now()
 	sa, err := e.mapSimilarArtists(ctx, similar, includeNotPresent)
+	log.Debug(ctx, "Mapped Similar Artists", "artist", artist.Name, "numSimilar", len(sa), "elapsed", time.Since(start))
 	if err != nil {
 		return
 	}
@@ -361,7 +505,7 @@ func (e *externalMetadata) findArtistByName(ctx context.Context, artistName stri
 	}
 	artist := &auxArtist{
 		Artist: artists[0],
-		Name:   clearName(artists[0].Name),
+		Name:   str.Clear(artists[0].Name),
 	}
 	return artist, nil
 }
@@ -406,4 +550,35 @@ func (e *externalMetadata) loadSimilar(ctx context.Context, artist *auxArtist, c
 	}
 	artist.SimilarArtists = loaded
 	return nil
+}
+
+type refreshQueue[T any] chan<- *T
+
+func newRefreshQueue[T any](ctx context.Context, processFn func(context.Context, T) (T, error)) refreshQueue[T] {
+	queue := make(chan *T, refreshQueueLength)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(refreshDelay):
+				ctx, cancel := context.WithTimeout(ctx, refreshTimeout)
+				select {
+				case item := <-queue:
+					_, _ = processFn(ctx, *item)
+					cancel()
+				case <-ctx.Done():
+					cancel()
+				}
+			}
+		}
+	}()
+	return queue
+}
+
+func (q *refreshQueue[T]) enqueue(item *T) {
+	select {
+	case *q <- item:
+	default: // It is ok to miss a refresh request
+	}
 }
